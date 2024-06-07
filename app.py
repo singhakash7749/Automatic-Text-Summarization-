@@ -1,0 +1,261 @@
+import sys
+from enum import Enum
+from functools import wraps
+
+import bs4
+import docx
+import pytesseract
+
+# Set the path to the Tesseract executable
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+from PyPDF2 import PdfReader
+import requests
+from PIL import Image
+from flask import Flask, request, render_template, redirect, url_for, session, flash
+from transformers import T5ForConditionalGeneration, T5Tokenizer, BartForConditionalGeneration, BartTokenizer
+from textblob import TextBlob
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from selenium import webdriver
+from readability import Document
+from webdriver_manager.firefox import GeckoDriverManager
+from selenium.webdriver.chrome.service import Service
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:Summary#2024@localhost:3306/ats'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = True
+db = SQLAlchemy(app)
+app.secret_key = 'your_secret_key'
+
+class Role(Enum):
+    ADMIN = 'admin'
+    USER = 'user'
+
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    role = db.Column(db.Enum(Role), default=Role.USER)
+    enabled = db.Column(db.Boolean, default=True)
+
+    def __repr__(self):
+        return '<User %r>' % self.username
+
+
+def requires_role(role):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if session.get('role') != role.name:
+                return redirect(url_for('unauthorized'))
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def requires_admin():
+    return requires_role(Role.ADMIN)
+
+
+def requires_user():
+    return requires_role(Role.USER)
+
+
+# Sample user and admin data (replace with database integration)
+users = {'user': {'password': 'password'}, 'admin': {'password': 'admin'}}
+
+# model
+abstractive_model = BartForConditionalGeneration.from_pretrained('facebook/bart-large-cnn')
+abstractive_tokenizer = BartTokenizer.from_pretrained('facebook/bart-large-cnn')
+
+
+def check_password(username, password):
+    user = User.query.filter_by(username=username).first()
+    if user:
+        if check_password_hash(user.password, password) or user.role == Role.ADMIN:
+            return user
+    return None
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        user = check_password(username, password)
+        if user and user.enabled is True:
+            session['username'] = user.username
+            session['role'] = user.role.name
+            flash('Login successful!', 'success')
+            return redirect(url_for('index'))
+        elif user and user.enabled is False:
+            return "Your account is disabled."
+        else:
+            return "Invalid credentials"
+    return render_template('login.html')
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        email = request.form['email']
+        existing_user = User.query.filter(
+            (User.username == username) | (User.email == email)
+        ).first()
+        if existing_user:
+            flash('Username or email already exists.', 'error')
+            return redirect(url_for('register'))
+        password_hash = generate_password_hash(password)
+        new_user = User(username=username, email=email, password=password_hash, enabled=True)
+        db.session.add(new_user)
+        db.session.commit()
+        flash('Registration successful!', 'success')
+        return redirect(url_for('login'))
+    return render_template('register.html')
+
+
+@app.route('/logout')
+def logout():
+    session.pop('username', None)
+    return redirect(url_for('login'))
+
+
+@app.route('/unauthorized')
+def unauthorized():
+    return 'You do not have permission to access this page.', 403
+
+
+@requires_admin()
+@app.route('/disable_user', methods=['POST'])
+def disable_user():
+    username = request.form['disabled_user']
+    user = User.query.filter_by(username=username).first()
+    if user and user.enabled:
+        user.enabled = False
+        db.session.commit()
+        return 'User disabled successfully', 200
+    else:
+        return 'User not found', 404
+
+
+@app.route('/')
+def index():
+    if 'username' in session:
+        return render_template('index.html')
+    else:
+        return redirect(url_for('login'))
+
+
+def abstract_summary(text, length):
+    input_ids = abstractive_tokenizer.batch_encode_plus([text], max_length=1024, truncation=True, return_tensors='pt')[
+        'input_ids']
+    summary_ids = abstractive_model.generate(input_ids, num_beams=4, min_length=length,max_length=length, early_stopping=True)
+    return abstractive_tokenizer.decode(summary_ids.squeeze(), skip_special_tokens=True)
+
+
+def split_text(text):
+    sentences = text.split('.')
+    new_text = ""
+    for i, sentence in enumerate(sentences):
+        if not len(sentence):
+            continue
+        if (i != 0) and (not (i % 4)):
+            new_text += '<br/><br/>'
+        new_text += sentence + '. '
+    return new_text
+
+
+def extract_content_from_url(url):
+    options = webdriver.FirefoxOptions()
+    options.headless = True
+    try:
+        driver = webdriver.Firefox( options=options)
+        driver.get(url)
+    except Exception as e:
+        return e
+    html = driver.page_source
+    doc = Document(html)
+    main_content = doc.summary()
+    soup = bs4.BeautifulSoup(main_content, 'html.parser')
+    elements = soup.find_all('div')
+    text = ''.join(element.get_text() for element in elements)
+    driver.quit()
+    return text
+
+
+@app.route('/summarize', methods=['POST'])
+def summarize_text():
+    session['loading'] = True
+    if 'username' in session:
+        summary_length = int(request.form['summary_length'])
+
+        # Initialize input_text variable
+        input_text = ""
+
+        # Check if input text is provided directly
+        if 'input_text' in request.form and request.form['input_text'].strip():
+            input_text = request.form['input_text']
+
+        if 'file_pdf' in request.files:
+            file = request.files['file_pdf']
+            if file.filename and file.filename.lower().endswith(('.pdf', '.txt')):
+                file_name = file.filename
+                print("File name:", file_name)
+                # Read the file content
+                reader = PdfReader(file)
+                text = ""
+                for page in reader.pages:
+                    text += page.extract_text()
+                input_text = text
+
+        # parse .docx files
+        if 'file_docx' in request.files:
+            file = request.files['file_docx']
+            if file.filename and file.filename.lower().endswith('.docx'):
+                doc = docx.Document(file)
+                full_text = []
+                for para in doc.paragraphs:
+                    full_text.append(para.text)
+                input_text = '\n'.join(full_text)
+
+        # Check if an image file is uploaded
+        if 'file' in request.files:
+            file = request.files['file']
+            if file.filename and file.filename.endswith(('.jpg', '.jpeg', '.png')):
+                img = Image.open(file)
+                input_text = pytesseract.image_to_string(img)
+
+        # Check if a URL is provided
+        if 'url_input' in request.form and request.form['url_input'].strip():
+            url_input = request.form['url_input']
+            try:
+                input_text = extract_content_from_url(url_input)
+                session['loading'] = False
+            except Exception as e:
+                session['loading'] = False
+                return f'Invalid URL or failed to fetch content {e}', 403
+
+        # Summarize the input text
+        if input_text.strip():
+            summarization = abstract_summary(input_text, summary_length)
+            sentiment_analysis = TextBlob(summarization).sentiment
+            summarization = split_text(summarization)
+            session['loading'] = False
+            return render_template('summary.html', summarization=summarization, sentiment_analysis=sentiment_analysis)
+        else:
+            session['loading'] = False
+            return "No input provided for summarization."
+    else:
+        session['loading'] = False
+        return redirect(url_for('login'))
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
