@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {}
+            }
+        }
+    </script>
+</head>
+<body class="w-screen h-screen bg-cyan-900 flex justify-center items-center">
+<div class="flex-col w-1/4 bg-white rounded-lg shadow-xl p-4 ">
+    <h2 class="font-bold text-cyan-900 mb-4 text-xl">Login</h2>
+    <form method="post" class="flex-col">
+        <label class="hidden" hidden="hidden" for="username"></label>
+        <input placeholder="Username" class="m-0 bg-white w-full rounded-lg p-3 border border-gray-200" type="text"
+               id="username" name="username" required><br><br>
+        <label class="hidden" hidden="hidden" for="password"></label>
+        <input placeholder="Password" class="bg-white w-full rounded-lg p-3 border border-gray-200" type="password"
+               id="password" name="password" required><br><br>
+        <div class="text-sm text-gray-500">Don't have an account? <a class="text-blue-600" href="/register">Sign Up</a>
+        </div>
+        <div class="flex justify-center">
+            <button class="p-3 mt-3 font-bold flex bg-cyan-900 hover:bg-cyan-700 text-white rounded-lg" type="submit">
+                Login
+            </button>
+        </div>
+    </form>
+</div>
+
+</body>
+</html>
